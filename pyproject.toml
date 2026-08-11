@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rba-event-publisher"
+version = "0.1.0"
+description = "Drain decision-service outbox → RabbitMQ (transactional outbox bridge)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Juan Ignacio Gonzalez" }]
+dependencies = [
+    "pydantic>=2.6",
+    "pydantic-settings>=2.3",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "pika>=1.3",
+    "rba-contracts>=0.1.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+rba-event-publisher = "rba_event_publisher.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
