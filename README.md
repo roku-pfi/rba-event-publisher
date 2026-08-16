@@ -48,6 +48,9 @@ rba-event-publisher
 # or: ONCE=true rba-event-publisher
 ```
 
+Image (from polyrepo root): `docker build -f rba-event-publisher/Dockerfile -t rba-event-publisher:dev .`
+Cluster: `../rba-infra/scripts/k3d-up.sh`.
+
 Decision-service must have created the `outbox` table (start the PDP once).
 Consumers (`rba-profile-service`, `rba-audit-service`) bind their own queues
 to the same exchange.
@@ -71,5 +74,5 @@ to the same exchange.
 
 ## Status
 
-Phase 4 thin slice. Remaining: DLQ, metrics, k8s Deployment. Roadmap:
-`../docs/plans/status.md`.
+Phase 4 thin slice. k8s Deployment via `../rba-infra` Helm (K8s-1). Remaining:
+DLQ. Roadmap: `../docs/plans/status.md`.
