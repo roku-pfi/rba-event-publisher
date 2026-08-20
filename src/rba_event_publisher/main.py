@@ -16,21 +16,30 @@ from rba_event_publisher.outbox import fetch_unpublished
 logger = logging.getLogger(__name__)
 
 
-def drain_once(session: Session, bus: BusPublisher, batch_size: int) -> int:
+def drain_once(session: Session, bus: BusPublisher, batch_size: int) -> tuple[int, int]:
+    """Publish one batch. Returns ``(attempted, published)``.
+
+    These two numbers must stay separate. Reporting only the batch size hides a
+    broker outage completely: every row fails, ``published_at`` stays NULL, the
+    same rows are retried forever, and the log still reads as if work is getting
+    done.
+    """
     rows = fetch_unpublished(session, batch_size)
     if not rows:
-        return 0
+        return (0, 0)
     now = datetime.now(timezone.utc)
+    published = 0
     for row in rows:
         try:
             bus.publish(row.channel, row.payload)
             row.published_at = now
             row.last_error = None
+            published += 1
         except Exception as exc:  # noqa: BLE001 — persist and continue
             logger.exception("publish failed event_id=%s", row.event_id)
             row.last_error = str(exc)[:2000]
     session.commit()
-    return len(rows)
+    return (len(rows), published)
 
 
 def run(settings: Settings | None = None) -> None:
@@ -45,12 +54,29 @@ def run(settings: Settings | None = None) -> None:
         settings.poll_interval_seconds,
         settings.batch_size,
     )
+    stalled = 0
     try:
         while True:
             with factory() as session:
-                n = drain_once(session, bus, settings.batch_size)
-                if n:
-                    logger.info("published %d outbox row(s)", n)
+                attempted, published = drain_once(session, bus, settings.batch_size)
+            if attempted:
+                logger.info("published %d/%d outbox row(s)", published, attempted)
+            if attempted and not published:
+                stalled += 1
+                if stalled == 1 or stalled % 30 == 0:
+                    logger.error(
+                        "publishing is stalled: %d attempt(s) in a row moved nothing "
+                        "— the broker link is down and profiles are no longer updating",
+                        stalled,
+                    )
+            else:
+                if stalled:
+                    logger.info("publishing recovered after %d stalled poll(s)", stalled)
+                stalled = 0
+                if not attempted:
+                    # Idle: no publish means no AMQP traffic, so heartbeats need
+                    # servicing or the broker closes the link out from under us.
+                    bus.keepalive()
             if settings.once:
                 break
             time.sleep(settings.poll_interval_seconds)
