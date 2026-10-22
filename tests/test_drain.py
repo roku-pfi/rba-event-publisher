@@ -106,3 +106,26 @@ def test_published_rows_are_stamped_with_a_tz_aware_time() -> None:
     stamped = session.rows[0].published_at
     assert stamped is not None and stamped.tzinfo is not None
     assert stamped <= datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------- pacing
+
+
+def test_a_full_healthy_batch_goes_again_at_once() -> None:
+    from rba_event_publisher.main import pause_after
+
+    assert pause_after(50, 50, 50, 1.0) == 0.0
+
+
+def test_a_partial_batch_means_drained_so_it_waits() -> None:
+    from rba_event_publisher.main import pause_after
+
+    assert pause_after(12, 12, 50, 1.0) == 1.0
+    assert pause_after(0, 0, 50, 1.0) == 1.0
+
+
+def test_a_failing_batch_waits_instead_of_spinning() -> None:
+    from rba_event_publisher.main import pause_after
+
+    assert pause_after(50, 0, 50, 1.0) == 1.0
+    assert pause_after(50, 49, 50, 1.0) == 1.0

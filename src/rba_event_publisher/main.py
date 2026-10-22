@@ -42,6 +42,21 @@ def drain_once(session: Session, bus: BusPublisher, batch_size: int) -> tuple[in
     return (len(rows), published)
 
 
+def pause_after(attempted: int, published: int, batch_size: int, poll_seconds: float) -> float:
+    """How long to wait before the next batch.
+
+    A full batch that went out whole means more rows are waiting: go again at
+    once. Sleeping after every batch capped the relay at ``batch_size`` rows per
+    poll (50/s), below what the PDP writes under load, so after the load scene
+    profiles lagged minutes behind and a stuffing burst reached the failure
+    window late (e2e, 2026-10-22). Sleep only when the outbox is drained or
+    publishing is failing.
+    """
+    if attempted == batch_size and published == attempted:
+        return 0.0
+    return poll_seconds
+
+
 def run(settings: Settings | None = None) -> None:
     settings = settings or get_settings()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -79,7 +94,9 @@ def run(settings: Settings | None = None) -> None:
                     bus.keepalive()
             if settings.once:
                 break
-            time.sleep(settings.poll_interval_seconds)
+            pause = pause_after(attempted, published, settings.batch_size, settings.poll_interval_seconds)
+            if pause:
+                time.sleep(pause)
     finally:
         bus.close()
 
