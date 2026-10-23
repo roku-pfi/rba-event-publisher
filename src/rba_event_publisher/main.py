@@ -11,7 +11,7 @@ from sqlalchemy import create_engine
 
 from rba_event_publisher.bus import BusPublisher
 from rba_event_publisher.config import Settings, get_settings
-from rba_event_publisher.readmodel import DECISION_MADE_CHANNEL, ReadModelWriter
+from rba_event_publisher.readmodel import ReadModelWriter
 from rba_event_publisher.stream import Entry, StreamReader
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ def relay(entries: list[Entry], writer: ReadModelWriter, bus: BusPublisher) -> l
     not acknowledged either; it is reclaimed and retried, and consumers are
     idempotent on event_id.
     """
-    writer.write([e.payload for e in entries if e.channel == DECISION_MADE_CHANNEL])
+    writer.write([(e.channel, e.payload) for e in entries])
     done = []
     for entry in entries:
         try:

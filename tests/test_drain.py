@@ -12,7 +12,7 @@ published.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -49,10 +49,19 @@ def _decision() -> dict:
 
 
 def _entries(*channels: str) -> list[Entry]:
-    return [
-        Entry(f"{i}-0", ch, _decision() if ch == DECISION else {"event_id": str(uuid4())})
-        for i, ch in enumerate(channels)
-    ]
+    out: list[Entry] = []
+    for i, ch in enumerate(channels):
+        if ch == DECISION:
+            payload = _decision()
+        else:  # a confirmation of the latest decision in the batch, if any
+            last = next((e.payload for e in reversed(out) if e.channel == DECISION), None)
+            payload = {
+                "event_id": str(uuid4()),
+                "decision_event_id": last["event_id"] if last else str(uuid4()),
+                "occurred_at": datetime(2026, 10, 23, 15, 1, tzinfo=timezone.utc).isoformat(),
+            }
+        out.append(Entry(f"{i}-0", ch, payload))
+    return out
 
 
 class FakeReader:
@@ -122,7 +131,7 @@ def test_a_reclaimed_entry_is_not_recorded_twice(engine) -> None:
 
 def test_a_read_model_failure_acks_nothing(engine) -> None:
     class BrokenWriter:
-        def write(self, events: list[dict]) -> None:
+        def write(self, entries: list[tuple[str, dict]]) -> None:
             raise RuntimeError("database unreachable")
 
     reader = FakeReader(_entries(DECISION))
@@ -164,3 +173,14 @@ def test_a_healthy_relay_never_sleeps() -> None:
 
 def test_a_failing_batch_waits_instead_of_spinning() -> None:
     assert pause_after(50, 0, 1.0) == 1.0
+
+
+def test_a_confirmation_marks_its_decision_passed(engine) -> None:
+    """RF-11: the read model tells a completed step-up from an abandoned one."""
+    reader = FakeReader(_entries(DECISION, DECISION, CONFIRMED))
+    drain_once(reader, ReadModelWriter(engine), FakeBus(), 50, 0)  # type: ignore[arg-type]
+    with engine.connect() as conn:
+        passed = dict(conn.execute(select(decisions.c.event_id, decisions.c.step_up_passed_at)).all())
+    first, second = (UUID(e.payload["event_id"]) for e in reader.entries[:2])
+    assert passed[first] is None
+    assert passed[second] is not None

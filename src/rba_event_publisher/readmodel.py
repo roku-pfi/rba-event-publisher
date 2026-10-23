@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from rba_contracts.events import DECISION_MADE_CHANNEL
+from rba_contracts.events import DECISION_MADE_CHANNEL, LOGIN_CONFIRMED_CHANNEL
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -20,6 +20,7 @@ from sqlalchemy import (
     String,
     Table,
     Uuid,
+    update,
 )
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.engine import Engine
@@ -48,6 +49,7 @@ decisions = Table(
     Column("features", _JSON),
     Column("login", _JSON),
     Column("scored_at", DateTime(timezone=True)),
+    Column("step_up_passed_at", DateTime(timezone=True)),
 )
 
 
@@ -75,16 +77,30 @@ def row_from_event(event: dict) -> dict:
 
 
 class ReadModelWriter:
-    """One transaction per batch; an entry seen twice (a reclaim) is skipped."""
+    """One transaction per batch; an entry seen twice (a reclaim) is skipped.
+
+    Decisions are inserted first, then each confirmation marks its decision's
+    step-up as passed (RF-11): a confirmation always follows its decision in
+    the stream, so the row is there by then.
+    """
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
         dialect = postgresql if engine.dialect.name == "postgresql" else sqlite
         self._insert = dialect.insert
 
-    def write(self, events: list[dict]) -> None:
-        if not events:
+    def write(self, entries: list[tuple[str, dict]]) -> None:
+        made = [p for channel, p in entries if channel == DECISION_MADE_CHANNEL]
+        confirmed = [p for channel, p in entries if channel == LOGIN_CONFIRMED_CHANNEL]
+        if not made and not confirmed:
             return
-        stmt = self._insert(decisions).on_conflict_do_nothing(index_elements=["event_id"])
         with self._engine.begin() as conn:
-            conn.execute(stmt, [row_from_event(e) for e in events])
+            if made:
+                stmt = self._insert(decisions).on_conflict_do_nothing(index_elements=["event_id"])
+                conn.execute(stmt, [row_from_event(e) for e in made])
+            for event in confirmed:
+                conn.execute(
+                    update(decisions)
+                    .where(decisions.c.event_id == UUID(event["decision_event_id"]))
+                    .values(step_up_passed_at=datetime.fromisoformat(event["occurred_at"]))
+                )
