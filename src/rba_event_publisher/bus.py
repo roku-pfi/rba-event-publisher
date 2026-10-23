@@ -62,7 +62,7 @@ class BusPublisher:
         self.connect()
 
     def keepalive(self) -> None:
-        """Service heartbeats while the outbox is empty.
+        """Service heartbeats while the stream is empty.
 
         A blocking connection only talks to the broker inside a blocking call.
         An idle publisher makes none, so without this the broker eventually
@@ -99,9 +99,8 @@ class BusPublisher:
     def publish(self, routing_key: str, payload: dict[str, Any]) -> None:
         """Publish one event, reconnecting once if the link has died.
 
-        Raises if the retry also fails — the caller records the error on the
-        outbox row and leaves ``published_at`` NULL, so the row is retried on
-        the next poll.
+        Raises if the retry also fails — the caller leaves the stream entry
+        unacknowledged, so it is reclaimed and retried.
         """
         body = json.dumps(payload, default=str).encode("utf-8")
 

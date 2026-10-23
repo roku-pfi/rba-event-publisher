@@ -1,81 +1,99 @@
-"""Poll unpublished outbox rows and publish to RabbitMQ."""
+"""Relay the decision journal: Valkey stream → decisions read model + RabbitMQ (ADR-0044)."""
 
 from __future__ import annotations
 
 import logging
+import socket
 import time
-from datetime import datetime, timezone
 
+import redis
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
 
 from rba_event_publisher.bus import BusPublisher
 from rba_event_publisher.config import Settings, get_settings
-from rba_event_publisher.outbox import fetch_unpublished
+from rba_event_publisher.readmodel import DECISION_MADE_CHANNEL, ReadModelWriter
+from rba_event_publisher.stream import Entry, StreamReader
 
 logger = logging.getLogger(__name__)
 
 
-def drain_once(session: Session, bus: BusPublisher, batch_size: int) -> tuple[int, int]:
-    """Publish one batch. Returns ``(attempted, published)``.
+def relay(entries: list[Entry], writer: ReadModelWriter, bus: BusPublisher) -> list[str]:
+    """Record and publish one batch. Returns the ids to acknowledge.
+
+    The read model is written first, in one transaction: if that fails nothing
+    is acknowledged and the batch comes back. An entry whose publish fails is
+    not acknowledged either; it is reclaimed and retried, and consumers are
+    idempotent on event_id.
+    """
+    writer.write([e.payload for e in entries if e.channel == DECISION_MADE_CHANNEL])
+    done = []
+    for entry in entries:
+        try:
+            bus.publish(entry.channel, entry.payload)
+            done.append(entry.id)
+        except Exception:  # noqa: BLE001 — leave it pending and continue
+            logger.exception("publish failed event_id=%s", entry.payload.get("event_id"))
+    return done
+
+
+def drain_once(
+    reader: StreamReader, writer: ReadModelWriter, bus: BusPublisher, batch_size: int, block_ms: int
+) -> tuple[int, int]:
+    """One batch. Returns ``(attempted, published)``.
 
     These two numbers must stay separate. Reporting only the batch size hides a
-    broker outage completely: every row fails, ``published_at`` stays NULL, the
-    same rows are retried forever, and the log still reads as if work is getting
-    done.
+    broker outage completely: every entry fails, the same entries are retried
+    forever, and the log still reads as if work is getting done.
     """
-    rows = fetch_unpublished(session, batch_size)
-    if not rows:
+    entries = reader.read(batch_size, block_ms)
+    if not entries:
         return (0, 0)
-    now = datetime.now(timezone.utc)
-    published = 0
-    for row in rows:
-        try:
-            bus.publish(row.channel, row.payload)
-            row.published_at = now
-            row.last_error = None
-            published += 1
-        except Exception as exc:  # noqa: BLE001 — persist and continue
-            logger.exception("publish failed event_id=%s", row.event_id)
-            row.last_error = str(exc)[:2000]
-    session.commit()
-    return (len(rows), published)
+    done = relay(entries, writer, bus)
+    reader.ack(done)
+    return (len(entries), len(done))
 
 
-def pause_after(attempted: int, published: int, batch_size: int, poll_seconds: float) -> float:
+def pause_after(attempted: int, published: int, poll_seconds: float) -> float:
     """How long to wait before the next batch.
 
-    A full batch that went out whole means more rows are waiting: go again at
-    once. Sleeping after every batch capped the relay at ``batch_size`` rows per
-    poll (50/s), below what the PDP writes under load, so after the load scene
-    profiles lagged minutes behind and a stuffing burst reached the failure
-    window late (e2e, 2026-10-22). Sleep only when the outbox is drained or
-    publishing is failing.
+    The read blocks until entries arrive, so a healthy relay never sleeps.
+    Sleeping after every batch once capped it below what the PDP writes under
+    load, and profiles lagged minutes behind (e2e, 2026-10-22). Sleep only while
+    publishing is failing, so a dead broker is not retried in a tight loop.
     """
-    if attempted == batch_size and published == attempted:
-        return 0.0
-    return poll_seconds
+    if attempted and not published:
+        return poll_seconds
+    return 0.0
 
 
 def run(settings: Settings | None = None) -> None:
     settings = settings or get_settings()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    engine = create_engine(settings.database_url, future=True)
-    factory = sessionmaker(bind=engine, future=True)
+    writer = ReadModelWriter(create_engine(settings.database_url, future=True))
+    reader = StreamReader(
+        redis.Redis.from_url(settings.redis_url, decode_responses=True),
+        settings.stream,
+        settings.group,
+        settings.consumer or socket.gethostname(),
+        claim_idle_ms=settings.claim_idle_ms,
+    )
+    reader.ensure_group()
     bus = BusPublisher(settings.rabbitmq_url, settings.exchange_name)
     bus.connect()
-    logger.info(
-        "event-publisher started poll=%.1fs batch=%d",
-        settings.poll_interval_seconds,
-        settings.batch_size,
-    )
+    logger.info("event-publisher started stream=%s batch=%d", settings.stream, settings.batch_size)
     stalled = 0
     try:
         while True:
-            with factory() as session:
-                attempted, published = drain_once(session, bus, settings.batch_size)
+            try:
+                attempted, published = drain_once(
+                    reader, writer, bus, settings.batch_size, settings.block_ms
+                )
+            except Exception:  # Valkey or Postgres unreachable: nothing was acked
+                logger.exception("relay failed; the batch stays pending")
+                time.sleep(settings.poll_interval_seconds)
+                continue
             if attempted:
-                logger.info("published %d/%d outbox row(s)", published, attempted)
+                logger.info("published %d/%d event(s)", published, attempted)
             if attempted and not published:
                 stalled += 1
                 if stalled == 1 or stalled % 30 == 0:
@@ -94,7 +112,7 @@ def run(settings: Settings | None = None) -> None:
                     bus.keepalive()
             if settings.once:
                 break
-            pause = pause_after(attempted, published, settings.batch_size, settings.poll_interval_seconds)
+            pause = pause_after(attempted, published, settings.poll_interval_seconds)
             if pause:
                 time.sleep(pause)
     finally:
